@@ -1,0 +1,62 @@
+name: nezhaapp
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v2.0.0). If empty, will use repo variable NEZHAAPP"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 必须要有写权限，才能创建 Release
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build frontend
+        working-directory: dashboard/resource
+        run: |
+          pnpm install
+          pnpm build
+
+      - name: Build app binaries
+        id: build
+        working-directory: dashboard
+        run: |
+          VERSION=${{ github.event.inputs.version }}
+          if [ -z "$VERSION" ]; then
+            VERSION=${{ vars.NEZHAAPP }}
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+          GOOS=linux GOARCH=amd64 go build -o app-linux-amd64-$VERSION .
+          GOOS=linux GOARCH=arm64 go build -o app-linux-arm64-$VERSION .
+
+      - name: Release binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: Release ${{ env.VERSION }}
+          files: |
+            dashboard/app-linux-amd64-${{ env.VERSION }}
+            dashboard/app-linux-arm64-${{ env.VERSION }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
