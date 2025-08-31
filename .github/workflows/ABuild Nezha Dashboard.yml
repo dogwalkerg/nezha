@@ -1,0 +1,58 @@
+name: ABuild Nezha Dashboard
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v2.0.0)"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 👈 允许写 Release
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build frontend
+        working-directory: dashboard/resource
+        run: |
+          pnpm install
+          pnpm build
+
+      - name: Build binaries
+        working-directory: dashboard
+        run: |
+          VERSION=${{ github.event.inputs.version }}
+          GOOS=linux GOARCH=amd64 go build -o app-linux-amd64-$VERSION .
+          GOOS=linux GOARCH=arm64 go build -o app-linux-arm64-$VERSION .
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: Release ${{ github.event.inputs.version }}
+          files: |
+            dashboard/app-linux-amd64-${{ github.event.inputs.version }}
+            dashboard/app-linux-arm64-${{ github.event.inputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
