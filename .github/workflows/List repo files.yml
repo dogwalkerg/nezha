@@ -1,2 +1,0 @@
-- name: List repo files
-  run: ls -R
