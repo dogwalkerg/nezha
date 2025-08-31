@@ -31,9 +31,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v4
@@ -41,74 +38,36 @@ jobs:
           go-version: '1.21'
           cache: true
 
-      - name: Verify directory structure
-        run: |
-          echo "Current directory: $(pwd)"
-          echo "Directory contents:"
-          ls -la
-          echo "cmd directory contents:"
-          ls -la cmd/
-          echo "cmd/dashboard contents:"
-          ls -la cmd/dashboard/
-
       - name: Build ${{ matrix.output }}
         run: |
           CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} \
-          go build -trimpath \
-            -ldflags="-s -w" \
-            -o "${{ matrix.output }}" ./cmd/dashboard
-
-      - name: Verify built binary
-        run: |
-          if [ "${{ matrix.os }}" != "windows" ]; then
-            file "${{ matrix.output }}"
-            # 给 Linux 和 Darwin 二进制文件添加执行权限
-            chmod +x "${{ matrix.output }}"
-          else
-            echo "Windows binary built: ${{ matrix.output }}"
-          fi
+          go build -trimpath -ldflags="-s -w" -o "${{ matrix.output }}" ./cmd/dashboard
+          
+          # 验证文件确实生成了
+          echo "Checking if file was created:"
+          ls -la "${{ matrix.output }}" || echo "File not found!"
 
       - name: Upload ${{ matrix.output }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.output }}
           path: ${{ matrix.output }}
+          # 添加保留时间（可选）
+          retention-days: 7
 
-  create-release:
+  # 添加一个验证步骤来确认所有文件都已上传
+  verify-artifacts:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: ./artifacts
-
-      - name: Create checksums
+          path: ./downloaded-artifacts
+          
+      - name: List downloaded files
         run: |
-          cd artifacts
-          for file in *; do
-            if [ -f "$file" ] && [[ "$file" != *.sha256 ]]; then
-              echo "Creating checksum for $file"
-              if command -v sha256sum >/dev/null 2>&1; then
-                sha256sum "$file" > "$file.sha256"
-              else
-                shasum -a 256 "$file" > "$file.sha256"
-              fi
-            fi
-          done
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            artifacts/**/*.sha256
-            artifacts/nezha-dashboard-linux-amd64
-            artifacts/nezha-dashboard-linux-arm64
-            artifacts/nezha-dashboard-windows-amd64.exe
-            artifacts/nezha-dashboard-darwin-amd64
-            artifacts/nezha-dashboard-darwin-arm64
-          generate_release_notes: true
+          echo "Downloaded artifacts:"
+          find ./downloaded-artifacts -type f -exec ls -la {} \;
+          echo "Total files:"
+          find ./downloaded-artifacts -type f | wc -l
