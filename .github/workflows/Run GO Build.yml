@@ -1,18 +1,27 @@
-name: Run GO Build
+name: Run Tests and Build
 
 on:
   push:
+    branches:
+      - master
     paths:
-      - "**.go"
-      - "go.mod"
-      - "go.sum"
-      - "resource/**"
-      - ".github/workflows/build.yml"
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'resource/**'
+      - '.github/workflows/**'
   pull_request:
     branches:
       - master
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'resource/**'
   release:
     types: [published]
+  # 添加手动触发
+  workflow_dispatch:
 
 jobs:
   tests:
@@ -61,7 +70,6 @@ jobs:
       - name: Generate swagger docs
         run: |
           go install github.com/swaggo/swag/cmd/swag@latest
-          # 创建必要的目录文件
           mkdir -p ./cmd/dashboard/user-dist ./cmd/dashboard/admin-dist
           touch ./cmd/dashboard/user-dist/a ./cmd/dashboard/admin-dist/a
           swag init --pd -d . -g ./cmd/dashboard/main.go -o ./cmd/dashboard/docs --parseGoList=false
@@ -72,23 +80,19 @@ jobs:
 
       - name: Build binary
         run: |
-          # 创建输出目录
           mkdir -p dist
           
-          # 设置编译参数
           PACKAGE_NAME="nezha-dashboard"
           VERSION="${{ steps.version.outputs.VERSION }}"
           BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
           COMMIT_HASH=$(git rev-parse --short HEAD)
           
-          # 编译命令
           go build -v -ldflags="\
-            -X 'github.com/nezhahq/nezha/cmd/dashboard/controller.version=$VERSION' \
-            -X 'github.com/nezhahq/nezha/cmd/dashboard/controller.commit=$COMMIT_HASH' \
-            -X 'github.com/nezhahq/nezha/cmd/dashboard/controller.buildTime=$BUILD_TIME'" \
+            -X 'main.version=$VERSION' \
+            -X 'main.commit=$COMMIT_HASH' \
+            -X 'main.buildTime=$BUILD_TIME'" \
             -o "dist/${PACKAGE_NAME}-${{ matrix.name }}-amd64${{ matrix.ext }}" ./cmd/dashboard
           
-          # 显示文件信息
           echo "=== Built Binary ==="
           ls -la dist/
           if [ "${{ matrix.os }}" != "windows-latest" ]; then
@@ -105,10 +109,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}-binary
-          path: |
-            dist/nezha-dashboard-${{ matrix.name }}-amd64${{ matrix.ext }}
+          path: dist/nezha-dashboard-${{ matrix.name }}-amd64${{ matrix.ext }}
           retention-days: 30
-          if-no-files-found: error
 
   release:
     needs: tests
@@ -137,7 +139,4 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v1
         with:
-          files: |
-            artifacts/**/nezha-dashboard-*
-            artifacts/**/*.sha256
-          generate_release_notes: true
+          files: artifacts/**/*
