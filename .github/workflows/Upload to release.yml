@@ -1,0 +1,9 @@
+- name: Upload to release
+  uses: actions/upload-release-asset@v1
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  with:
+    upload_url: ${{ github.event.release.upload_url }}
+    asset_path: ./cmd/dashboard/dashboard
+    asset_name: nezha-dashboard
+    asset_content_type: application/octet-stream
