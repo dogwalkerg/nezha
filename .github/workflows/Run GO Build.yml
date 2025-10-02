@@ -1,0 +1,143 @@
+name: Run GO Build
+
+on:
+  push:
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - "resource/**"
+      - ".github/workflows/build.yml"
+  pull_request:
+    branches:
+      - master
+  release:
+    types: [published]
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            name: linux
+            ext: ""
+          - os: windows-latest
+            name: windows
+            ext: ".exe"
+          - os: macos-latest
+            name: darwin
+            ext: ""
+
+    runs-on: ${{ matrix.os }}
+    env:
+      GO111MODULE: on
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Get version info
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "release" ]; then
+            echo "VERSION=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            COMMIT_HASH=$(git rev-parse --short HEAD)
+            echo "VERSION=dev-$COMMIT_HASH" >> $GITHUB_OUTPUT
+          fi
+          echo "Version: ${{ steps.version.outputs.VERSION }}"
+
+      - name: Generate swagger docs
+        run: |
+          go install github.com/swaggo/swag/cmd/swag@latest
+          # 创建必要的目录文件
+          mkdir -p ./cmd/dashboard/user-dist ./cmd/dashboard/admin-dist
+          touch ./cmd/dashboard/user-dist/a ./cmd/dashboard/admin-dist/a
+          swag init --pd -d . -g ./cmd/dashboard/main.go -o ./cmd/dashboard/docs --parseGoList=false
+
+      - name: Run unit tests
+        run: |
+          go test -v -race ./...
+
+      - name: Build binary
+        run: |
+          # 创建输出目录
+          mkdir -p dist
+          
+          # 设置编译参数
+          PACKAGE_NAME="nezha-dashboard"
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          
+          # 编译命令
+          go build -v -ldflags="\
+            -X 'github.com/nezhahq/nezha/cmd/dashboard/controller.version=$VERSION' \
+            -X 'github.com/nezhahq/nezha/cmd/dashboard/controller.commit=$COMMIT_HASH' \
+            -X 'github.com/nezhahq/nezha/cmd/dashboard/controller.buildTime=$BUILD_TIME'" \
+            -o "dist/${PACKAGE_NAME}-${{ matrix.name }}-amd64${{ matrix.ext }}" ./cmd/dashboard
+          
+          # 显示文件信息
+          echo "=== Built Binary ==="
+          ls -la dist/
+          if [ "${{ matrix.os }}" != "windows-latest" ]; then
+            file "dist/${PACKAGE_NAME}-${{ matrix.name }}-amd64${{ matrix.ext }}"
+          fi
+
+      - name: Run security scan (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        uses: securego/gosec@master
+        with:
+          args: --exclude=G104,G402,G115,G203 ./...
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-binary
+          path: |
+            dist/nezha-dashboard-${{ matrix.name }}-amd64${{ matrix.ext }}
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    needs: tests
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          
+      - name: Display structure of downloaded files
+        run: ls -R artifacts/
+        
+      - name: Create checksums
+        run: |
+          cd artifacts
+          find . -name "nezha-dashboard-*" -type f | while read file; do
+            echo "Creating checksum for: $file"
+            sha256sum "$file" > "$file.sha256"
+          done
+          
+      - name: Upload to release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/**/nezha-dashboard-*
+            artifacts/**/*.sha256
+          generate_release_notes: true
