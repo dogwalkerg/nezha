@@ -1,0 +1,68 @@
+name: GO Dashboard
+
+on:
+  push:
+    tags: ['v1.14.2']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Dashboard
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.24.x"
+
+    - name: Prepare frontends' dists
+      run: |
+        # 检查是否有获取前端资源的脚本
+        if [ -f "./script/fetch-frontends.sh" ]; then
+          echo "使用项目自带的前端获取脚本..."
+          chmod +x ./script/fetch-frontends.sh
+          ./script/fetch-frontends.sh
+        else
+          echo "创建基本的前端资源目录..."
+          mkdir -p cmd/dashboard/{admin-dist,user-dist}
+          # 创建基本的占位文件
+          echo "Frontend resources would be here" > cmd/dashboard/admin-dist/index.html
+          echo "Frontend resources would be here" > cmd/dashboard/user-dist/index.html
+        fi
+
+    - name: Generate swagger docs
+      run: |
+        go install github.com/swaggo/swag/cmd/swag@latest
+        swag init --pd -d . -g ./cmd/dashboard/main.go -o ./cmd/dashboard/docs --parseGoList=false
+
+    - name: Build binaries
+      run: |
+        mkdir -p dist
+        
+        echo "Building Linux AMD64..."
+        GOOS=linux GOARCH=amd64 go build -o dist/dashboard-linux-amd64 ./cmd/dashboard
+        
+        echo "Building Linux ARM64..."
+        GOOS=linux GOARCH=arm64 go build -o dist/dashboard-linux-arm64 ./cmd/dashboard
+        
+        echo "Building Windows AMD64..."
+        GOOS=windows GOARCH=amd64 go build -o dist/dashboard-windows-amd64.exe ./cmd/dashboard
+
+    - name: Show build results
+      run: |
+        echo "构建完成的文件:"
+        ls -la dist/
+        echo "文件信息:"
+        file dist/*
+
+    - name: Upload binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: nezha-dashboard-binaries
+        path: dist/
+        retention-days: 30
