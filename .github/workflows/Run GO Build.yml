@@ -2,25 +2,11 @@ name: Run Tests and Build
 
 on:
   push:
-    branches:
-      - master
-    paths:
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'resource/**'
-      - '.github/workflows/**'
+    branches: [master]
   pull_request:
-    branches:
-      - master
-    paths:
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'resource/**'
+    branches: [master]
   release:
     types: [published]
-  # 添加手动触发
   workflow_dispatch:
 
 jobs:
@@ -58,6 +44,7 @@ jobs:
 
       - name: Get version info
         id: version
+        shell: bash  # 强制使用 bash，即使在 Windows 上
         run: |
           if [ "${{ github.event_name }}" == "release" ]; then
             echo "VERSION=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
@@ -68,6 +55,7 @@ jobs:
           echo "Version: ${{ steps.version.outputs.VERSION }}"
 
       - name: Generate swagger docs
+        shell: bash
         run: |
           go install github.com/swaggo/swag/cmd/swag@latest
           mkdir -p ./cmd/dashboard/user-dist ./cmd/dashboard/admin-dist
@@ -75,10 +63,11 @@ jobs:
           swag init --pd -d . -g ./cmd/dashboard/main.go -o ./cmd/dashboard/docs --parseGoList=false
 
       - name: Run unit tests
-        run: |
-          go test -v -race ./...
+        shell: bash
+        run: go test -v -race ./...
 
       - name: Build binary
+        shell: bash
         run: |
           mkdir -p dist
           
@@ -95,9 +84,6 @@ jobs:
           
           echo "=== Built Binary ==="
           ls -la dist/
-          if [ "${{ matrix.os }}" != "windows-latest" ]; then
-            file "dist/${PACKAGE_NAME}-${{ matrix.name }}-amd64${{ matrix.ext }}"
-          fi
 
       - name: Run security scan (Linux only)
         if: matrix.os == 'ubuntu-latest'
@@ -111,32 +97,3 @@ jobs:
           name: ${{ matrix.name }}-binary
           path: dist/nezha-dashboard-${{ matrix.name }}-amd64${{ matrix.ext }}
           retention-days: 30
-
-  release:
-    needs: tests
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          
-      - name: Display structure of downloaded files
-        run: ls -R artifacts/
-        
-      - name: Create checksums
-        run: |
-          cd artifacts
-          find . -name "nezha-dashboard-*" -type f | while read file; do
-            echo "Creating checksum for: $file"
-            sha256sum "$file" > "$file.sha256"
-          done
-          
-      - name: Upload to release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: artifacts/**/*
