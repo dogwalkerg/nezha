@@ -1,0 +1,223 @@
+name: 03Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g., v1.14.3)'
+        required: true
+        default: 'v1.14.3'
+      create_release:
+        description: 'Create GitHub Release'
+        required: true
+        type: boolean
+        default: true
+      overwrite_release:
+        description: 'Overwrite existing release if it exists'
+        required: true
+        type: boolean
+        default: false
+      build_docker:
+        description: 'Build Docker image locally'
+        required: true
+        type: boolean
+        default: false
+      push_docker_ghcr:
+        description: 'Push Docker image to GHCR (requires PAT)'
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+    branches:
+      - dev
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, windows]
+        goarch: [amd64]
+        include:
+          - goos: linux
+            goarch: arm64
+
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    container:
+      image: goreleaser/goreleaser-cross:v1.24
+    steps:
+      - run: |
+          apt update && apt install unzip curl -y
+          wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
+          chmod +x /usr/bin/yq
+
+      - run: git config --global --add safe.directory /__w/nezha/nezha
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare frontends' dists
+        run: |
+          chmod +x ./script/fetch-frontends.sh && ./script/fetch-frontends.sh
+
+      - name: Fetch IPInfo GeoIP Database
+        env:
+          IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN }}
+        run: |
+          rm -f pkg/geoip/geoip.db
+          wget -qO pkg/geoip/geoip.db https://ipinfo.io/data/free/country.mmdb?token=${IPINFO_TOKEN} || echo "GeoIP download failed, continuing without it"
+
+      - name: Create minimal swagger docs to satisfy build
+        run: |
+          mkdir -p ./cmd/dashboard/docs
+          echo '{"swagger":"2.0","info":{"title":"Nezha API","version":"1.0.0"}}' > ./cmd/dashboard/docs/swagger.json
+          echo 'package docs' > ./cmd/dashboard/docs/docs.go
+          echo 'Minimal swagger docs created successfully'
+
+      - name: Build with tag
+        if: contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate
+
+      - name: Build snapshot
+        if: contains(github.ref, 'refs/tags/') == false && github.event_name == 'push'
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate --snapshot
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ./dist/*/*
+
+  release:
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    needs: build
+    name: Release
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./assets
+
+      - name: Archive and compress binaries
+        run: |
+          find assets/*/*/* -type f | while read -r file; do
+            dir=$(dirname "$file")
+            filename=$(basename "$file")
+            fileWithoutExt="${filename%.*}"
+            zip -jr "$dir/$fileWithoutExt.zip" "$file"
+          done
+
+      - name: Set release tag
+        id: set-tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check if release exists
+        id: check-release
+        run: |
+          RESPONSE=$(curl -s -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.set-tag.outputs.tag }}" || echo "{}")
+          if echo "$RESPONSE" | grep -q '"message":"Not Found"'; then
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "exists=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        if: steps.check-release.outputs.exists == 'false' || (github.event_name == 'workflow_dispatch' && inputs.overwrite_release)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.set-tag.outputs.tag }}
+          artifacts: "assets/*/*/*.zip"
+          generateReleaseNotes: true
+          allowUpdates: true
+
+      - name: Skip Release
+        if: steps.check-release.outputs.exists == 'true' && (github.event_name != 'workflow_dispatch' || !inputs.overwrite_release)
+        run: echo "Release already exists, skipping..."
+
+  # 简化的 Docker 构建
+  docker:
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.event_name != 'workflow_dispatch' || inputs.build_docker || inputs.push_docker_ghcr)
+    needs: build
+    name: Docker Build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./downloaded-artifacts
+
+      - name: Prepare binaries for Docker
+        run: |
+          mkdir -p dist
+          find downloaded-artifacts -name "dashboard-linux-*" -type f -exec cp {} dist/ \;
+          echo "Binaries prepared:"
+          ls -la dist/
+
+      - name: Extract tag name
+        id: extract_tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG_NAME="${{ inputs.release_tag }}"
+          elif [[ $GITHUB_REF == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+          else
+            TAG_NAME="latest"
+          fi
+          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image only
+        if: (github.event_name == 'workflow_dispatch' && inputs.build_docker && !inputs.push_docker_ghcr) || (github.event_name == 'push' && !contains(github.ref, 'refs/tags/'))
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: |
+            nezha:${{ steps.extract_tag.outputs.tag }}
+          outputs: type=docker,dest=/tmp/nezha.tar
+
+      - name: Build and push to GHCR (with proper auth)
+        if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.push_docker_ghcr)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/nezha:${{ steps.extract_tag.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          secrets: |
+            GITHUB_TOKEN=${{ secrets.GHCR_PAT }}
