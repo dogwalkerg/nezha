@@ -63,23 +63,10 @@ jobs:
           rm -f pkg/geoip/geoip.db
           wget -qO pkg/geoip/geoip.db https://ipinfo.io/data/free/country.mmdb?token=${IPINFO_TOKEN} || echo "GeoIP download failed, continuing without it"
 
-      - name: Try to generate swagger docs (optional)
+      - name: Skip swagger generation
         run: |
-          echo "Attempting to generate swagger docs..."
-          # 检查是否存在 swagger 注释的文件
-          if find . -name "*.go" -exec grep -l "// @ " {} \; | head -1; then
-            echo "Found swagger annotations, generating docs..."
-            # 尝试安装 swag
-            go install github.com/swaggo/swag/cmd/swag@v1.16.3 2>/dev/null || go install github.com/swaggo/swag/cmd/swag@latest 2>/dev/null || echo "Swag install failed"
-            # 尝试生成文档
-            if command -v swag &> /dev/null; then
-              swag init --pd -d . -g ./cmd/dashboard/main.go -o ./cmd/dashboard/docs --parseGoList=false 2>&1 | head -20 || echo "Swagger generation failed, but continuing build"
-            else
-              echo "Swag command not available, skipping swagger generation"
-            fi
-          else
-            echo "No swagger annotations found, skipping swagger generation"
-          fi
+          echo "Skipping swagger documentation generation to avoid build issues"
+          echo "If swagger docs are needed, they should be pre-generated and committed to the repository"
 
       - name: Build with tag
         if: contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
