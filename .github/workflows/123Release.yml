@@ -1,7 +1,7 @@
 name: 123Release
 
 on:
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:
     inputs:
       release_tag:
         description: 'Release tag (e.g., v1.14.3)'
@@ -14,6 +14,16 @@ on:
         default: true
       push_to_aliyun:
         description: 'Push to Aliyun Container Registry'
+        required: true
+        type: boolean
+        default: false
+      push_to_ghcr:
+        description: 'Push to GitHub Container Registry'
+        required: true
+        type: boolean
+        default: false
+      overwrite_release:
+        description: 'Overwrite existing release if it exists'
         required: true
         type: boolean
         default: false
@@ -68,7 +78,6 @@ jobs:
           echo "Creating minimal swagger documentation to satisfy build requirements..."
           mkdir -p ./cmd/dashboard/docs
           
-          # 创建基本的 swagger.json 文件
           cat > ./cmd/dashboard/docs/swagger.json << 'EOF'
           {
             "swagger": "2.0",
@@ -84,11 +93,9 @@ jobs:
           }
           EOF
           
-          # 创建基本的 docs.go 文件
           cat > ./cmd/dashboard/docs/docs.go << 'EOF'
           package docs
           
-          // SwaggerInfo holds exported Swagger Info so clients can modify it
           var SwaggerInfo = &swaggerInfo{
           	Version:     "1.0.0",
           	Host:        "localhost:8000",
@@ -98,7 +105,6 @@ jobs:
           	Description: "Nezha Monitoring System Dashboard API",
           }
           
-          // swaggerInfo holds exported Swagger Info so clients can modify it
           type swaggerInfo struct {
           	Version     string
           	Host        string
@@ -114,7 +120,6 @@ jobs:
           EOF
           
           echo "Minimal swagger docs created successfully"
-          ls -la ./cmd/dashboard/docs/
 
       - name: Build with tag
         if: contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
@@ -176,12 +181,39 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Release
+      - name: Check if release exists
+        id: check-release
+        run: |
+          RESPONSE=$(curl -s -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.set-tag.outputs.tag }}" || echo "{}")
+          if echo "$RESPONSE" | grep -q '"message":"Not Found"'; then
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release ${{ steps.set-tag.outputs.tag }} already exists"
+          fi
+
+      - name: Delete existing release
+        if: steps.check-release.outputs.exists == 'true' && (github.event_name == 'workflow_dispatch' && inputs.overwrite_release)
+        run: |
+          curl -X DELETE -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.set-tag.outputs.tag }}" || echo "Failed to delete release, continuing..."
+          curl -X DELETE -H "Authorization: token ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${{ steps.set-tag.outputs.tag }}" || echo "Failed to delete tag, continuing..."
+
+      - name: Create Release
+        if: steps.check-release.outputs.exists == 'false' || (github.event_name == 'workflow_dispatch' && inputs.overwrite_release)
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ steps.set-tag.outputs.tag }}
           artifacts: "assets/*/*/*.zip"
           generateReleaseNotes: true
+          allowUpdates: true
+
+      - name: Skip Release
+        if: steps.check-release.outputs.exists == 'true' && (github.event_name != 'workflow_dispatch' || !inputs.overwrite_release)
+        run: |
+          echo "Release ${{ steps.set-tag.outputs.tag }} already exists and overwrite is disabled. Skipping release creation."
 
       - name: Purge jsdelivr cache
         run: |
@@ -189,19 +221,6 @@ jobs:
           curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/nezha-agent.service
           curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/docker-compose.yaml
           curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/config.yaml
-          LOWER_USERNAME=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/nezha@master/script/install.sh
-          curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/nezha@master/script/nezha-agent.service
-          curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/nezha@master/script/docker-compose.yaml
-          curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/nezha@master/script/config.yaml
-
-      - name: Trigger sync
-        if: github.event_name == 'push'
-        env:
-          GH_REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run sync-release.yml
 
   release-docker:
     runs-on: ubuntu-latest
@@ -209,8 +228,8 @@ jobs:
     needs: build
     name: Release Docker images
     permissions:
-      packages: write
       contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -252,8 +271,8 @@ jobs:
           echo "ALI_IMAGE_NAME=$ALI_IMAGE_NAME" >> $GITHUB_OUTPUT
         id: image-name
 
-      - name: Build dashboard image only (no push)
-        if: github.event_name == 'workflow_dispatch' && !inputs.push_to_aliyun
+      - name: Build only (no push) - Default
+        if: (github.event_name == 'workflow_dispatch' && !inputs.push_to_ghcr && !inputs.push_to_aliyun) || (github.event_name == 'push' && !contains(github.ref, 'refs/tags/'))
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -263,8 +282,8 @@ jobs:
           tags: |
             ${{ steps.image-name.outputs.GHCR_IMAGE_NAME }}:${{ steps.extract_branch.outputs.tag }}
 
-      - name: Build and push to GHCR only
-        if: (contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && (github.event_name != 'workflow_dispatch' || inputs.push_to_aliyun == false)
+      - name: Build and push to GHCR (with proper auth)
+        if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.push_to_ghcr)
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -273,8 +292,10 @@ jobs:
           push: true
           tags: |
             ${{ steps.image-name.outputs.GHCR_IMAGE_NAME }}:${{ steps.extract_branch.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Build and push to Aliyun only
+      - name: Build and push to Aliyun
         if: (contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && (github.event_name != 'workflow_dispatch' || inputs.push_to_aliyun)
         uses: docker/build-push-action@v5
         with:
@@ -284,14 +305,3 @@ jobs:
           push: true
           tags: |
             ${{ steps.image-name.outputs.ALI_IMAGE_NAME }}:${{ steps.extract_branch.outputs.tag }}
-
-      - name: Build dashboard image snapshot only
-        if: contains(github.ref, 'refs/tags/') == false && github.event_name == 'push'
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64,linux/s390x
-          push: false
-          tags: |
-            ${{ steps.image-name.outputs.GHCR_IMAGE_NAME }}:${{ steps.extract_branch.outputs.tag }}
