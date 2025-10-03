@@ -1,6 +1,7 @@
 name: 0Release
 
 on:
+  workflow_dispatch:  # 手动触发
   push:
     tags:
       - "v1.14.3"
@@ -88,7 +89,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
+    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || github.event_name == 'workflow_dispatch'
     needs: build
     name: Release
     steps:
@@ -134,7 +135,7 @@ jobs:
 
   release-docker:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: (github.event_name == 'push') || github.event_name == 'workflow_dispatch'
     needs: build
     name: Release Docker images
     steps:
@@ -169,7 +170,7 @@ jobs:
           password: ${{ github.token }}
 
       - name: Log in to the AliyunCS
-        if: contains(github.ref, 'refs/tags/')
+        if: contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: docker/login-action@master
         with:
           registry: registry.cn-shanghai.aliyuncs.com
@@ -194,7 +195,7 @@ jobs:
         id: image-name
 
       - name: Build dasbboard image And Push with tag
-        if: contains(github.ref, 'refs/tags/')
+        if: contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -208,7 +209,7 @@ jobs:
             ${{ steps.image-name.outputs.ALI_IMAGE_NAME }}:${{ steps.extract_branch.outputs.tag }}
 
       - name: Build dasbboard image And Push snapshot
-        if: contains(github.ref, 'refs/tags/') == false
+        if: contains(github.ref, 'refs/tags/') == false && github.event_name == 'push'
         uses: docker/build-push-action@v5
         with:
           context: .
