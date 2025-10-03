@@ -1,4 +1,4 @@
-name: KK0Release
+name: ook Release
 
 on:
   workflow_dispatch:
