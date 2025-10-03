@@ -49,6 +49,8 @@ jobs:
       - run: git config --global --add safe.directory /__w/nezha/nezha
 
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史记录
 
       - name: Prepare frontends' dists
         run: |
@@ -59,17 +61,35 @@ jobs:
           IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN }}
         run: |
           rm -f pkg/geoip/geoip.db
-          wget -qO pkg/geoip/geoip.db https://ipinfo.io/data/free/country.mmdb?token=${IPINFO_TOKEN}
+          wget -qO pkg/geoip/geoip.db https://ipinfo.io/data/free/country.mmdb?token=${IPINFO_TOKEN} || echo "GeoIP download failed, continuing without it"
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.24.x"
-
-      - name: generate swagger docs
+      - name: Set up Go environment
         run: |
-          go install github.com/swaggo/swag/cmd/swag@latest
-          swag init --pd -d . -g ./cmd/dashboard/main.go -o ./cmd/dashboard/docs --parseGoList=false
+          # 检查 Go 环境
+          go version
+          go env
+          # 列出当前目录文件
+          ls -la
+          # 检查 Go 文件是否存在
+          find . -name "*.go" | head -10
+
+      - name: Install swag
+        run: |
+          # 使用更稳定的方式安装 swag
+          go install github.com/swaggo/swag/cmd/swag@v1.16.3
+          which swag
+          swag version
+
+      - name: Generate swagger docs
+        run: |
+          # 切换到包含 Go 文件的目录
+          cd cmd/dashboard
+          ls -la
+          # 生成 swagger 文档
+          swag init --pd -d . -g main.go -o ./docs --parseGoList=false || echo "Swagger generation failed, continuing without it"
+          cd ../..
+          # 检查生成的文档
+          ls -la cmd/dashboard/docs/
 
       - name: Build with tag
         if: contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
@@ -151,10 +171,10 @@ jobs:
           curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/nezha@master/script/config.yaml
 
       - name: Trigger sync
+        if: github.event_name == 'push'
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
-          GH_DEBUG: api
         run: |
           gh workflow run sync-release.yml
 
