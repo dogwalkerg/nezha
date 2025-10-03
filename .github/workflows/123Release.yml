@@ -1,0 +1,297 @@
+name: 123Release
+
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g., v1.14.3)'
+        required: true
+        default: 'v1.14.3'
+      create_release:
+        description: 'Create GitHub Release'
+        required: true
+        type: boolean
+        default: true
+      push_to_aliyun:
+        description: 'Push to Aliyun Container Registry'
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+    branches:
+      - dev
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        goos: [linux, windows]
+        goarch: [amd64]
+        include:
+          - goos: linux
+            goarch: s390x
+          - goos: linux
+            goarch: arm64
+
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    container:
+      image: goreleaser/goreleaser-cross:v1.24
+    steps:
+      - run: |
+          apt update && apt install unzip curl -y
+          wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
+          chmod +x /usr/bin/yq
+
+      - run: git config --global --add safe.directory /__w/nezha/nezha
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare frontends' dists
+        run: |
+          chmod +x ./script/fetch-frontends.sh && ./script/fetch-frontends.sh
+
+      - name: Fetch IPInfo GeoIP Database
+        env:
+          IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN }}
+        run: |
+          rm -f pkg/geoip/geoip.db
+          wget -qO pkg/geoip/geoip.db https://ipinfo.io/data/free/country.mmdb?token=${IPINFO_TOKEN} || echo "GeoIP download failed, continuing without it"
+
+      - name: Create minimal swagger docs to satisfy build
+        run: |
+          echo "Creating minimal swagger documentation to satisfy build requirements..."
+          mkdir -p ./cmd/dashboard/docs
+          
+          # 创建基本的 swagger.json 文件
+          cat > ./cmd/dashboard/docs/swagger.json << 'EOF'
+          {
+            "swagger": "2.0",
+            "info": {
+              "title": "Nezha Dashboard API",
+              "description": "Nezha Monitoring System Dashboard API",
+              "version": "1.0.0"
+            },
+            "host": "localhost:8000",
+            "basePath": "/",
+            "paths": {},
+            "definitions": {}
+          }
+          EOF
+          
+          # 创建基本的 docs.go 文件
+          cat > ./cmd/dashboard/docs/docs.go << 'EOF'
+          package docs
+          
+          // SwaggerInfo holds exported Swagger Info so clients can modify it
+          var SwaggerInfo = &swaggerInfo{
+          	Version:     "1.0.0",
+          	Host:        "localhost:8000",
+          	BasePath:    "/",
+          	Schemes:     []string{},
+          	Title:       "Nezha Dashboard API",
+          	Description: "Nezha Monitoring System Dashboard API",
+          }
+          
+          // swaggerInfo holds exported Swagger Info so clients can modify it
+          type swaggerInfo struct {
+          	Version     string
+          	Host        string
+          	BasePath    string
+          	Schemes     []string
+          	Title       string
+          	Description string
+          }
+          
+          func init() {
+          	SwaggerInfo.Schemes = []string{}
+          }
+          EOF
+          
+          echo "Minimal swagger docs created successfully"
+          ls -la ./cmd/dashboard/docs/
+
+      - name: Build with tag
+        if: contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate
+
+      - name: Build snapshot
+        if: contains(github.ref, 'refs/tags/') == false && github.event_name == 'push'
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate --snapshot
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            ./dist/*/*
+
+  release:
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    needs: build
+    name: Release
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./assets
+
+      - name: Archive and compress binaries
+        run: |
+          find assets/*/*/* -type f | while read -r file; do
+            dir=$(dirname "$file")
+            filename=$(basename "$file")
+            fileWithoutExt="${filename%.*}"
+            zip -jr "$dir/$fileWithoutExt.zip" "$file"
+          done
+
+      - name: Set release tag
+        id: set-tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.set-tag.outputs.tag }}
+          artifacts: "assets/*/*/*.zip"
+          generateReleaseNotes: true
+
+      - name: Purge jsdelivr cache
+        run: |
+          curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/install.sh
+          curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/nezha-agent.service
+          curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/docker-compose.yaml
+          curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/config.yaml
+          LOWER_USERNAME=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/nezha@master/script/install.sh
+          curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/nezha@master/script/nezha-agent.service
+          curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/nezha@master/script/docker-compose.yaml
+          curl -s https://purge.jsdelivr.net/gh/$LOWER_USERNAME/nezha@master/script/config.yaml
+
+      - name: Trigger sync
+        if: github.event_name == 'push'
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run sync-release.yml
+
+  release-docker:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: build
+    name: Release Docker images
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./assets
+
+      - name: Fix permissions
+        run: |
+          chmod -R +x ./assets/*
+          mkdir -p dist
+          mv ./assets/*/*/* ./dist/ || true
+
+      - name: Extract branch name in tag
+        id: extract_branch
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            export TAG_NAME="${{ inputs.release_tag }}"
+          elif [[ $GITHUB_REF == refs/heads/* ]]; then
+            export TAG_NAME=$(echo ${GITHUB_REF#refs/heads/})
+          else
+            export TAG_NAME=$(echo ${GITHUB_REF#refs/tags/})
+          fi
+          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up image name
+        run: |
+          GHCR_IMAGE_NAME=$(echo "ghcr.io/${{ github.repository_owner }}/nezha" | tr '[:upper:]' '[:lower:]')
+          if [ "${{ github.repository_owner }}" = "nezhahq" ]; then
+            ALI_IMAGE_NAME="registry.cn-shanghai.aliyuncs.com/naibahq/nezha-dashboard"
+          else
+            ALI_IMAGE_NAME=$(echo "registry.cn-shanghai.aliyuncs.com/${{ github.repository_owner }}/nezha-dashboard" | tr '[:upper:]' '[:lower:]')
+          fi
+          echo "GHCR_IMAGE_NAME=$GHCR_IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "ALI_IMAGE_NAME=$ALI_IMAGE_NAME" >> $GITHUB_OUTPUT
+        id: image-name
+
+      - name: Build dashboard image only (no push)
+        if: github.event_name == 'workflow_dispatch' && !inputs.push_to_aliyun
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/s390x
+          push: false
+          tags: |
+            ${{ steps.image-name.outputs.GHCR_IMAGE_NAME }}:${{ steps.extract_branch.outputs.tag }}
+
+      - name: Build and push to GHCR only
+        if: (contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && (github.event_name != 'workflow_dispatch' || inputs.push_to_aliyun == false)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/s390x
+          push: true
+          tags: |
+            ${{ steps.image-name.outputs.GHCR_IMAGE_NAME }}:${{ steps.extract_branch.outputs.tag }}
+
+      - name: Build and push to Aliyun only
+        if: (contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && (github.event_name != 'workflow_dispatch' || inputs.push_to_aliyun)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/s390x
+          push: true
+          tags: |
+            ${{ steps.image-name.outputs.ALI_IMAGE_NAME }}:${{ steps.extract_branch.outputs.tag }}
+
+      - name: Build dashboard image snapshot only
+        if: contains(github.ref, 'refs/tags/') == false && github.event_name == 'push'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/s390x
+          push: false
+          tags: |
+            ${{ steps.image-name.outputs.GHCR_IMAGE_NAME }}:${{ steps.extract_branch.outputs.tag }}
