@@ -1,4 +1,4 @@
-name: ook Release
+name: 正式版Release
 
 on:
   workflow_dispatch:
@@ -14,6 +14,16 @@ on:
         default: true
       overwrite_release:
         description: 'Overwrite existing release if it exists'
+        required: true
+        type: boolean
+        default: false
+      build_docker:
+        description: 'Build Docker image locally'
+        required: true
+        type: boolean
+        default: false
+      push_docker_ghcr:
+        description: 'Push Docker image to GHCR'
         required: true
         type: boolean
         default: false
@@ -213,17 +223,17 @@ jobs:
           curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/docker-compose.yaml
           curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/config.yaml
 
-  # 可选：本地 Docker 构建（不推送）
-  build-docker-local:
+  # Docker 构建和推送
+  docker:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.event_name != 'workflow_dispatch' || inputs.build_docker || inputs.push_docker_ghcr)
     needs: build
-    name: Build Docker Image (Local)
+    name: Docker Build and Push
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract branch name in tag
-        id: extract_branch
+      - name: Extract tag name
+        id: extract_tag
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             export TAG_NAME="${{ inputs.release_tag }}"
@@ -237,66 +247,35 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image locally
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64,linux/s390x
-          push: false
-          tags: |
-            nezha:${{ steps.extract_branch.outputs.tag }}
-          outputs: type=docker,dest=/tmp/nezha-image.tar
-
-      - name: Save Docker image as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: nezha-docker-image
-          path: /tmp/nezha-image.tar
-          retention-days: 1
-
-  # 可选：使用 PAT 的 Docker 推送（需要手动配置）
-  push-docker-ghcr:
-    runs-on: ubuntu-latest
-    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.create_release)
-    needs: build
-    name: Push Docker to GHCR (with PAT)
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Extract branch name in tag
-        id: extract_branch
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            export TAG_NAME="${{ inputs.release_tag }}"
-          else
-            export TAG_NAME=$(echo ${GITHUB_REF#refs/tags/})
-          fi
-          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
-
-      - name: Log into GitHub Container Registry with PAT
-        if: secrets.GHCR_PAT
+      - name: Log into GitHub Container Registry
+        if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.push_docker_ghcr)
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_PAT }}
 
-      - name: Build and push Docker image to GHCR
-        if: secrets.GHCR_PAT
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64,linux/s390x
-          push: true
+          push: ${{ (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.push_docker_ghcr) }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/nezha:${{ steps.extract_branch.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/nezha:${{ steps.extract_tag.outputs.tag }}
             ghcr.io/${{ github.repository_owner }}/nezha:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description="Nezha Monitoring System"
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Skip GHCR push (no PAT)
-        if: !secrets.GHCR_PAT
-        run: |
-          echo "Skipping GHCR push because GHCR_PAT secret is not configured."
-          echo "To enable GHCR pushes, create a Personal Access Token with 'write:packages' scope"
-          echo "and add it as a repository secret named 'GHCR_PAT'"
+      - name: Upload Docker image as artifact (if not pushed)
+        if: (github.event_name == 'workflow_dispatch' && inputs.build_docker && !inputs.push_docker_ghcr) || (github.event_name == 'push' && !contains(github.ref, 'refs/tags/'))
+        uses: actions/upload-artifact@v4
+        with:
+          name: nezha-docker-image
+          path: |
+            !**/node_modules/**
+          retention-days: 1
