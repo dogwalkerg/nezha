@@ -1,0 +1,353 @@
+name: 发布4 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g., v1.14.3)'
+        required: true
+        default: 'v1.14.3'
+      create_release:
+        description: 'Create GitHub Release'
+        required: true
+        type: boolean
+        default: true
+      overwrite_release:
+        description: 'Overwrite existing release if it exists'
+        required: true
+        type: boolean
+        default: false
+      build_docker:
+        description: 'Build Docker image locally'
+        required: true
+        type: boolean
+        default: false
+      push_docker_ghcr:
+        description: 'Push Docker image to GHCR'
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+    branches:
+      - dev
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+    name: Create Release
+    outputs:
+      release_tag: ${{ steps.set-tag.outputs.tag }}
+      release_exists: ${{ steps.check-release.outputs.exists }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set release tag
+        id: set-tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+          echo "Release tag: ${{ steps.set-tag.outputs.tag }}"
+
+      - name: Check if release exists
+        id: check-release
+        run: |
+          RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.set-tag.outputs.tag }}" || echo "{}")
+          if echo "$RESPONSE" | grep -q '"message":"Not Found"'; then
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release ${{ steps.set-tag.outputs.tag }} already exists"
+          fi
+
+      - name: Delete existing release
+        if: steps.check-release.outputs.exists == 'true' && (github.event_name == 'workflow_dispatch' && inputs.overwrite_release)
+        run: |
+          echo "Deleting existing release ${{ steps.set-tag.outputs.tag }}..."
+          curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.set-tag.outputs.tag }}" || echo "Failed to delete release, continuing..."
+          curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/${{ steps.set-tag.outputs.tag }}" || echo "Failed to delete tag, continuing..."
+          sleep 3
+
+      - name: Create Release
+        if: steps.check-release.outputs.exists == 'false' || (github.event_name == 'workflow_dispatch' && inputs.overwrite_release)
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.set-tag.outputs.tag }}
+          name: Release ${{ steps.set-tag.outputs.tag }}
+          body: |
+            自动发布的版本 ${{ steps.set-tag.outputs.tag }}
+            
+            ### 更新内容
+            - 自动构建的多平台二进制文件
+            - 包含 Linux/Windows 的 AMD64 架构
+            - 包含 Linux 的 ARM64 和 S390X 架构
+            - Docker 镜像支持多平台
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
+      - name: Skip Release Creation
+        if: steps.check-release.outputs.exists == 'true' && (github.event_name != 'workflow_dispatch' || !inputs.overwrite_release)
+        run: |
+          echo "Release ${{ steps.set-tag.outputs.tag }} already exists and overwrite is disabled. Skipping release creation."
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, windows]
+        goarch: [amd64]
+        include:
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: s390x
+
+    name: Build artifacts
+    runs-on: ubuntu-latest
+    container:
+      image: goreleaser/goreleaser-cross:v1.24
+    steps:
+      - run: |
+          apt update && apt install unzip curl -y
+          wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
+          chmod +x /usr/bin/yq
+
+      - run: git config --global --add safe.directory /__w/nezha/nezha
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare frontends' dists
+        run: |
+          chmod +x ./script/fetch-frontends.sh && ./script/fetch-frontends.sh
+
+      - name: Fetch IPInfo GeoIP Database
+        env:
+          IPINFO_TOKEN: ${{ secrets.IPINFO_TOKEN }}
+        run: |
+          rm -f pkg/geoip/geoip.db
+          wget -qO pkg/geoip/geoip.db https://ipinfo.io/data/free/country.mmdb?token=${IPINFO_TOKEN} || echo "GeoIP download failed, continuing without it"
+
+      - name: Create minimal swagger docs
+        run: |
+          echo "Creating minimal swagger documentation..."
+          mkdir -p ./cmd/dashboard/docs
+          
+          cat > ./cmd/dashboard/docs/swagger.json << 'EOF'
+          {
+            "swagger": "2.0",
+            "info": {
+              "title": "Nezha Dashboard API",
+              "description": "Nezha Monitoring System Dashboard API",
+              "version": "1.0.0"
+            },
+            "host": "localhost:8000",
+            "basePath": "/",
+            "paths": {},
+            "definitions": {}
+          }
+          EOF
+          
+          cat > ./cmd/dashboard/docs/docs.go << 'EOF'
+          package docs
+          
+          var SwaggerInfo = &swaggerInfo{
+          	Version:     "1.0.0",
+          	Host:        "localhost:8000",
+          	BasePath:    "/",
+          	Schemes:     []string{},
+          	Title:       "Nezha Dashboard API",
+          	Description: "Nezha Monitoring System Dashboard API",
+          }
+          
+          type swaggerInfo struct {
+          	Version     string
+          	Host        string
+          	BasePath    string
+          	Schemes     []string
+          	Title       string
+          	Description string
+          }
+          
+          func init() {
+          	SwaggerInfo.Schemes = []string{}
+          }
+          EOF
+          
+          echo "Minimal swagger docs created successfully"
+
+      - name: Build with tag
+        if: contains(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate
+
+      - name: Build snapshot
+        if: contains(github.ref, 'refs/tags/') == false && github.event_name == 'push'
+        uses: goreleaser/goreleaser-action@v6
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --single-target --clean --skip=validate --snapshot
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            ./dist/*/*
+
+      - name: List built artifacts
+        run: |
+          echo "Built artifacts:"
+          find ./dist -type f -name "*" | sort || echo "No artifacts found"
+
+  upload-assets:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    if: needs.create-release.outputs.release_exists == 'false' || (github.event_name == 'workflow_dispatch' && inputs.overwrite_release)
+    name: Upload Release Assets
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: List downloaded artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          find ./artifacts -type f -name "*" | sort
+          echo "Total files:"
+          find ./artifacts -type f -name "*" | wc -l
+
+      - name: Archive and compress binaries
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f | while read -r file; do
+            filename=$(basename "$file")
+            fileWithoutExt="${filename%.*}"
+            dir=$(dirname "$file")
+            platform=$(basename "$dir")
+            
+            # 创建压缩包
+            zip -j "release-assets/${platform}-${fileWithoutExt}.zip" "$file"
+          done
+          
+          echo "Created release assets:"
+          ls -la release-assets/
+
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.create-release.outputs.release_tag }}
+          files: release-assets/*.zip
+          body: |
+            自动发布的版本 ${{ needs.create-release.outputs.release_tag }}
+            
+            ### 包含的构建
+            - Linux AMD64
+            - Linux ARM64  
+            - Linux S390X
+            - Windows AMD64
+            
+            ### 使用说明
+            下载对应平台的压缩包，解压后即可使用。
+
+  docker:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.event_name != 'workflow_dispatch' || inputs.build_docker || inputs.push_docker_ghcr)
+    name: Docker Build and Push
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./downloaded-artifacts
+
+      - name: Prepare dist directory for Docker
+        run: |
+          echo "Preparing dist directory for Docker build..."
+          mkdir -p dist
+          find downloaded-artifacts -name "dashboard-*" -type f -exec cp {} dist/ \;
+          echo "Files in dist directory:"
+          ls -la dist/ || echo "No files in dist directory"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log into GitHub Container Registry
+        if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.push_docker_ghcr)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/s390x
+          push: ${{ (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.push_docker_ghcr) }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/nezha:${{ needs.create-release.outputs.release_tag }}
+            ghcr.io/${{ github.repository_owner }}/nezha:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description="Nezha Monitoring System"
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build only for testing
+        if: (github.event_name == 'workflow_dispatch' && inputs.build_docker && !inputs.push_docker_ghcr)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/s390x
+          push: false
+          tags: |
+            nezha:${{ needs.create-release.outputs.release_tag }}-test
+
+  purge-cache:
+    needs: [create-release, upload-assets]
+    runs-on: ubuntu-latest
+    name: Purge CDN Cache
+    steps:
+      - name: Purge jsdelivr cache
+        run: |
+          echo "Purging jsdelivr cache..."
+          curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/install.sh
+          curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/nezha-agent.service
+          curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/docker-compose.yaml
+          curl -s https://purge.jsdelivr.net/gh/${{ github.repository_owner }}/nezha@master/script/config.yaml
