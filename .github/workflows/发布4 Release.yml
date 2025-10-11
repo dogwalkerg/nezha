@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (e.g., v1.14.3)'
+        description: 'Release tag (e.g., v1.14.x)'
         required: true
-        default: 'v1.14.3'
+        default: 'v1.14.'
       create_release:
         description: 'Create GitHub Release'
         required: true
@@ -223,8 +223,15 @@ jobs:
           find ./dist -type f -name "*" | while read -r file; do
             dir=$(dirname "$file")
             filename=$(basename "$file")
+            
             # 简化文件名，去掉前缀
             newname=$(echo "$filename" | sed 's/.*-\(dashboard-.*\)/\1/')
+            
+            # 如果是 Windows 文件，去掉 .exe 后缀
+            if [[ "$newname" == *"windows"*".exe" ]]; then
+              newname="${newname%.exe}"
+            fi
+            
             if [[ "$filename" != "$newname" ]] && [[ ! -z "$newname" ]]; then
               mv "$file" "$dir/$newname"
               echo "Renamed: $filename -> $newname"
@@ -266,13 +273,16 @@ jobs:
           mkdir -p release-assets
           find artifacts -type f | while read -r file; do
             filename=$(basename "$file")
-            # 使用简化的文件名
-            if [[ "$filename" == dashboard-* ]]; then
-              zipname="${filename}.zip"
-            else
-              # 如果文件名已经简化，直接使用
-              zipname="${filename}.zip"
+            
+            # 统一处理文件名
+            # 1. 去掉前缀（如果存在）
+            clean_name=$(echo "$filename" | sed 's/.*-\(dashboard-.*\)/\1/')
+            # 2. 如果是 Windows 文件，确保没有 .exe 后缀
+            if [[ "$clean_name" == *"windows"*".exe" ]]; then
+              clean_name="${clean_name%.exe}"
             fi
+            
+            zipname="${clean_name}.zip"
             echo "Creating: $zipname from $file"
             zip -j "release-assets/${zipname}" "$file"
           done
@@ -326,35 +336,47 @@ jobs:
           echo "Files in dist directory:"
           ls -la dist/ || echo "No files in dist directory"
 
+      - name: Extract tag name
+        id: extract_tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            export TAG_NAME="${{ inputs.release_tag }}"
+          elif [[ $GITHUB_REF == refs/heads/* ]]; then
+            export TAG_NAME=$(echo ${GITHUB_REF#refs/heads/})
+          else
+            export TAG_NAME=$(echo ${GITHUB_REF#refs/tags/})
+          fi
+          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log into GitHub Container Registry (用户命名空间)
+      - name: Log into GitHub Container Registry
         if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.push_docker_ghcr)
-        run: |
-          # 使用用户级命名空间而不是组织级
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
 
-      - name: Build and push Docker image (用户命名空间)
-        if: (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.push_docker_ghcr)
+      - name: Build and push Docker image (all supported platforms)
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64,linux/s390x
-          push: true
-          # 使用用户级命名空间：ghcr.io/用户名/镜像名
+          push: ${{ (github.event_name == 'push' && contains(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.push_docker_ghcr) }}
           tags: |
-            ghcr.io/${{ github.actor }}/nezha:${{ needs.create-release.outputs.release_tag }}
-            ghcr.io/${{ github.actor }}/nezha:latest
+            ghcr.io/${{ github.repository_owner }}/nezha:${{ steps.extract_tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/nezha:latest
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description="Nezha Monitoring System"
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: false
+          no-cache-filters: none
 
-      - name: Build only for testing
+      - name: Build only (no push) for testing
         if: (github.event_name == 'workflow_dispatch' && inputs.build_docker && !inputs.push_docker_ghcr)
         uses: docker/build-push-action@v5
         with:
@@ -363,7 +385,8 @@ jobs:
           platforms: linux/amd64,linux/arm64,linux/s390x
           push: false
           tags: |
-            nezha:${{ needs.create-release.outputs.release_tag }}-test
+            nezha:${{ steps.extract_tag.outputs.tag }}-test
+          outputs: type=docker,dest=/tmp/nezha-test.tar
 
   purge-cache:
     needs: [create-release, upload-assets]
