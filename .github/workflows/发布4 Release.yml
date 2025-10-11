@@ -35,6 +35,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   create-release:
@@ -217,10 +218,24 @@ jobs:
           version: "~> v2"
           args: build --single-target --clean --skip=validate --snapshot
 
+      - name: Rename artifacts for cleaner names
+        run: |
+          echo "Renaming artifacts for cleaner file names..."
+          find ./dist -type f -name "*" | while read -r file; do
+            dir=$(dirname "$file")
+            filename=$(basename "$file")
+            # 简化文件名，去掉前缀
+            newname=$(echo "$filename" | sed 's/.*-\(dashboard-.*\)/\1/')
+            if [[ "$filename" != "$newname" ]] && [[ ! -z "$newname" ]]; then
+              mv "$file" "$dir/$newname"
+              echo "Renamed: $filename -> $newname"
+            fi
+          done
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dashboard-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
             ./dist/*/*
 
@@ -247,17 +262,20 @@ jobs:
           echo "Total files:"
           find ./artifacts -type f -name "*" | wc -l
 
-      - name: Archive and compress binaries
+      - name: Archive and compress binaries with clean names
         run: |
           mkdir -p release-assets
           find artifacts -type f | while read -r file; do
             filename=$(basename "$file")
-            fileWithoutExt="${filename%.*}"
-            dir=$(dirname "$file")
-            platform=$(basename "$dir")
-            
-            # 创建压缩包
-            zip -j "release-assets/${platform}-${fileWithoutExt}.zip" "$file"
+            # 使用简化的文件名
+            if [[ "$filename" == dashboard-* ]]; then
+              zipname="${filename}.zip"
+            else
+              # 如果文件名已经简化，直接使用
+              zipname="${filename}.zip"
+            fi
+            echo "Creating: $zipname from $file"
+            zip -j "release-assets/${zipname}" "$file"
           done
           
           echo "Created release assets:"
@@ -285,6 +303,9 @@ jobs:
     runs-on: ubuntu-latest
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.event_name != 'workflow_dispatch' || inputs.build_docker || inputs.push_docker_ghcr)
     name: Docker Build and Push
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -297,7 +318,15 @@ jobs:
         run: |
           echo "Preparing dist directory for Docker build..."
           mkdir -p dist
-          find downloaded-artifacts -name "dashboard-*" -type f -exec cp {} dist/ \;
+          # 复制并重命名文件，确保 Docker 能找到正确的架构文件
+          find downloaded-artifacts -type f -name "dashboard-linux-*" | while read -r file; do
+            filename=$(basename "$file")
+            # 简化文件名
+            newname=$(echo "$filename" | sed 's/.*-\(dashboard-linux-.*\)/\1/')
+            cp "$file" "dist/$newname"
+            echo "Copied: $filename -> $newname"
+          done
+          
           echo "Files in dist directory:"
           ls -la dist/ || echo "No files in dist directory"
 
@@ -309,7 +338,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
@@ -327,6 +356,7 @@ jobs:
             org.opencontainers.image.description="Nezha Monitoring System"
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: false
 
       - name: Build only for testing
         if: (github.event_name == 'workflow_dispatch' && inputs.build_docker && !inputs.push_docker_ghcr)
