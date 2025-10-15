@@ -26,8 +26,6 @@ def get_github_latest_release():
                 print(f"Failed to download {name}")
             file_abs_path = get_abs_path(asset.name)
             files.append(file_abs_path)
-        print('Checking file integrities')
-        verify_checksum(get_abs_path("checksums.txt"))
         sync_to_gitee(release.tag_name, release.body, files)
     else:
         print("No releases found.")
@@ -85,20 +83,9 @@ def sync_to_gitee(tag: str, body: str, files: slice):
         'name': tag,
         'body': body,
         'prerelease': False,
-        'target_commitish': 'main'
+        'target_commitish': 'master'
     }
-    while True:
-        try:
-            release_api_response = api_client.post(
-                release_api_uri, json=release_data, timeout=30)
-            release_api_response.raise_for_status()
-            break
-        except requests.exceptions.Timeout as errt:
-            print(f"Request timed out: {errt} Retrying in 60 seconds...")
-            time.sleep(60)
-        except requests.exceptions.RequestException as err:
-            print(f"Request failed: {err}")
-            break
+    release_api_response = api_client.post(release_api_uri, json=release_data)
     if release_api_response.status_code == 201:
         release_info = release_api_response.json()
         release_id = release_info.get('id')
@@ -131,8 +118,7 @@ def sync_to_gitee(tag: str, body: str, files: slice):
 
     # 仅保留最新 Release 以防超出 Gitee 仓库配额
     try:
-        delete_gitee_releases(release_id, api_client,
-                              release_api_uri, access_token)
+        delete_gitee_releases(release_id, api_client, release_api_uri, access_token)
     except ValueError as e:
         print(e)
 
@@ -143,36 +129,6 @@ def sync_to_gitee(tag: str, body: str, files: slice):
 def get_abs_path(path: str):
     wd = os.getcwd()
     return os.path.join(wd, path)
-
-
-def compute_sha256(file: str):
-    sha256_hash = hashlib.sha256()
-    buf_size = 65536
-    with open(file, 'rb') as f:
-        while True:
-            data = f.read(buf_size)
-            if not data:
-                break
-            sha256_hash.update(data)
-    return sha256_hash.hexdigest()
-
-
-def verify_checksum(checksum_file: str):
-    with open(checksum_file, 'r') as f:
-        lines = f.readlines()
-
-    for line in lines:
-        checksum, file = line.strip().split()
-        abs_path = get_abs_path(file)
-        computed_hash = compute_sha256(abs_path)
-
-        if checksum == computed_hash:
-            print(f"{file}: OK")
-        else:
-            print(f"{file}: FAIL (expected {checksum}, got {computed_hash})")
-            print("Will run the download process again")
-            get_github_latest_release()
-            break
 
 
 get_github_latest_release()
