@@ -2,7 +2,7 @@ name: 同步Sync Release to Gitee
 
 on:
   workflow_dispatch:
-
+    
 jobs:
   sync-release-to-gitee:
     runs-on: ubuntu-latest
@@ -14,4 +14,4 @@ jobs:
       - name: Sync to Gitee
         run: |
           pip3 install PyGitHub
-          python3 .github/workflows/sync1.py
+          python3 .github/sync1.py
